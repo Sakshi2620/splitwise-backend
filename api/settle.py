@@ -1,88 +1,119 @@
-"""
-Settle-up algorithm — minimum transactions to clear all debts.
-
-Algorithm (greedy on debt graph):
-1. Compute net balance per person:
-   net = total_paid - total_owed
-   positive  → person is owed money
-   negative  → person owes money
-2. Use two max-heaps: creditors (positive), debtors (negative).
-3. Each step: pair largest creditor with largest debtor.
-   Settle min(credit, debt). Push remainder back.
-4. Result: O(n) transactions where n = number of non-zero balances.
-   This is optimal for the greedy approach (proven for this class of problem).
-
-Money: all arithmetic in integer paise. Zero floats.
-"""
-
 import heapq
 from collections import defaultdict
 from decimal import Decimal
 
-
 def compute_balances(group):
-    """Net balance per user_id in paise. Positive = owed to them."""
     balances = defaultdict(int)
-    for expense in group.expenses.prefetch_related('shares').all():
-        balances[expense.paid_by_id] += expense.amount_paise
+
+    # Build user_id → member lookup as fallback for old expenses
+    user_to_member = {
+        m.user_id: m.id
+        for m in group.members.all()
+        if m.user_id is not None
+    }
+
+    for expense in group.expenses.prefetch_related(
+        'shares__member', 'shares__user'
+    ).select_related('paid_by_member', 'paid_by').all():
+
+        # Resolve payer member_id — new way first, fallback to user lookup
+        payer_mid = expense.paid_by_member_id
+        if not payer_mid and expense.paid_by_id:
+            payer_mid = user_to_member.get(expense.paid_by_id)
+
+        if payer_mid:
+            balances[payer_mid] += expense.amount_paise
+
         for share in expense.shares.all():
-            balances[share.user_id] -= share.amount_paise
+            mid = share.member_id
+            if not mid and share.user_id:
+                mid = user_to_member.get(share.user_id)
+            if mid:
+                balances[mid] -= share.amount_paise
+
     return dict(balances)
 
-
 def compute_settlements(group):
-    """Returns list of {from_user_id, to_user_id, amount_paise}."""
+    """Returns list of {from_member_id, to_member_id, amount_paise}."""
     balances = compute_balances(group)
     creditors, debtors = [], []
 
-    for uid, bal in balances.items():
+    for mid, bal in balances.items():
         if bal > 0:
-            heapq.heappush(creditors, (-bal, uid))   # max-heap via negation
+            heapq.heappush(creditors, (-bal, mid))
         elif bal < 0:
-            heapq.heappush(debtors, (bal, uid))       # min-heap (most negative first)
+            heapq.heappush(debtors, (bal, mid))
 
     transactions = []
     while creditors and debtors:
         credit_neg, creditor = heapq.heappop(creditors)
-        debt_neg, debtor = heapq.heappop(debtors)
-        credit = -credit_neg
-        debt = -debt_neg
+        debt_neg,   debtor   = heapq.heappop(debtors)
+        credit  = -credit_neg
+        debt    = -debt_neg
         settled = min(credit, debt)
-        transactions.append({'from_user_id': debtor, 'to_user_id': creditor, 'amount_paise': settled})
+        transactions.append({
+            'from_member_id': debtor,
+            'to_member_id':   creditor,
+            'amount_paise':   settled,
+        })
         if credit > settled:
             heapq.heappush(creditors, (-(credit - settled), creditor))
         if debt > settled:
-            heapq.heappush(debtors, (-(debt - settled), debtor))
+            heapq.heappush(debtors,   (-(debt - settled),   debtor))
 
     return transactions
 
 
 def get_balance_summary(group):
-    from .models import User
-    balances = compute_balances(group)
+    from .models import GroupMember
+
+    balances     = compute_balances(group)
     transactions = compute_settlements(group)
 
-    all_ids = set(balances.keys()) | {t['from_user_id'] for t in transactions} | {t['to_user_id'] for t in transactions}
-    users = {u.id: u for u in User.objects.filter(id__in=all_ids)}
+    # Load all members (real + pending) keyed by member.id
+    all_member_ids = (
+        set(balances.keys())
+        | {t['from_member_id'] for t in transactions}
+        | {t['to_member_id']   for t in transactions}
+    )
+    members = {
+        m.id: m
+        for m in GroupMember.objects.filter(id__in=all_member_ids).select_related('user')
+    }
 
-    def user_dict(uid):
-        u = users.get(uid)
-        return {'id': uid, 'name': u.name, 'avatar_color': u.avatar_color} if u else {}
+    def member_dict(mid):
+        m = members.get(mid)
+        if not m:
+            return {'id': None, 'name': '?', 'avatar_color': '#94a3b8'}
+        if m.user:
+            return {
+                'id':           m.user.id,
+                'name':         m.user.name,
+                'avatar_color': m.user.avatar_color,
+            }
+        # Pending member
+        colors = ['#6366f1','#ec4899','#10b981','#f59e0b','#3b82f6','#8b5cf6','#ef4444','#14b8a6']
+        idx    = sum(ord(c) for c in (m.invited_email or '')) % len(colors)
+        return {
+            'id':           None,
+            'name':         m.invited_name or m.invited_email or '?',
+            'avatar_color': colors[idx],
+        }
 
     return {
         'balances': [
             {
-                'user': user_dict(uid),
-                'net_paise': bal,
+                'user':       member_dict(mid),
+                'net_paise':  bal,
                 'net_rupees': str(Decimal(bal) / 100),
-                'status': 'owed' if bal > 0 else ('owes' if bal < 0 else 'settled'),
+                'status':     'owed' if bal > 0 else ('owes' if bal < 0 else 'settled'),
             }
-            for uid, bal in balances.items() if uid in users
+            for mid, bal in balances.items()
         ],
         'settlements': [
             {
-                'from_user': user_dict(t['from_user_id']),
-                'to_user': user_dict(t['to_user_id']),
+                'from_user':    member_dict(t['from_member_id']),
+                'to_user':      member_dict(t['to_member_id']),
                 'amount_paise': t['amount_paise'],
                 'amount_rupees': str(Decimal(t['amount_paise']) / 100),
             }
