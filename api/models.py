@@ -144,3 +144,55 @@ class ExpenseShare(models.Model):
     class Meta:
         db_table = 'expense_shares'
         unique_together = ('expense', 'user')
+
+class Settlement(models.Model):
+    STATUS_CHOICES = [
+        ('pending',   'Pending'),
+        ('partial',   'Partially Paid'),
+        ('completed', 'Completed'),
+    ]
+    group        = models.ForeignKey(Group, on_delete=models.CASCADE, related_name='settlements')
+    from_member  = models.ForeignKey(GroupMember, on_delete=models.CASCADE, related_name='settlements_owed')
+    to_member    = models.ForeignKey(GroupMember, on_delete=models.CASCADE, related_name='settlements_receiving')
+    total_paise  = models.IntegerField(default=0)   # original debt
+    paid_paise   = models.IntegerField(default=0)   # cumulative paid
+    status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('group', 'from_member', 'to_member')
+
+    @property
+    def remaining_paise(self):
+        return max(0, self.total_paise - self.paid_paise)
+
+    @property
+    def payer(self):
+        return self.from_member
+
+    @property
+    def receiver(self):
+        return self.to_member
+
+
+class SettlementPayment(models.Model):
+    PAYMENT_TYPE_CHOICES = [
+        ('partial', 'Partial'),
+        ('full',    'Full'),
+    ]
+    settlement   = models.ForeignKey(Settlement, on_delete=models.CASCADE, related_name='payments')
+    amount_paise = models.IntegerField()
+    paid_by      = models.ForeignKey(GroupMember, on_delete=models.SET_NULL, null=True, blank=True, related_name='settlement_payments_made')
+    paid_to      = models.ForeignKey(GroupMember, on_delete=models.SET_NULL, null=True, blank=True, related_name='settlement_payments_received')
+    payment_type = models.CharField(max_length=10, choices=PAYMENT_TYPE_CHOICES, default='partial')
+    note         = models.TextField(blank=True, default='')
+    created_at   = models.DateTimeField(auto_now_add=True)
+    paid_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"₹{self.amount_paise/100} at {self.created_at}"

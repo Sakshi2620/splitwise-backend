@@ -1,21 +1,21 @@
 import re
 
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from decimal import Decimal
 
 from .ai_parser import parse_bill_text, parse_expense_text
-from .models import Expense, Group, GroupMember, Notification, User
+from .models import User, Group, GroupMember, Expense, Notification, Settlement, SettlementPayment
 from .serializers import (
-    ExpenseSerializer,
-    GroupMemberSerializer,
-    GroupSerializer,
-    NotificationSerializer,
-    RegisterSerializer,
-    UserSerializer,
+    RegisterSerializer, UserSerializer,
+    GroupSerializer, GroupMemberSerializer,
+    ExpenseSerializer, NotificationSerializer,
+    SettlementSerializer,
 )
 from .settle import get_balance_summary
 
@@ -170,7 +170,190 @@ class NotificationViewSet(viewsets.ViewSet):
         return Response(
             {"message": "Notification marked as read"}
         )
+class SettlementViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
 
+    def _get_group(self, group_id, user):
+        group = get_object_or_404(Group, pk=group_id)
+        if not GroupMember.objects.filter(group=group, user=user).exists():
+            return None, Response({'error': 'Not a member'}, status=403)
+        return group, None
+
+    @action(detail=False, methods=['get'], url_path='group/(?P<group_id>[^/.]+)')
+    def list_for_group(self, request, group_id=None):
+        group, err = self._get_group(group_id, request.user)
+        if err: return err
+        # Sync settlements from current balances
+        self._sync_settlements(group)
+        settlements = list(
+            Settlement.objects.filter(group=group)
+            .prefetch_related(
+                'payments',
+                'payments__paid_by__user',
+                'payments__paid_to__user',
+                'from_member__user',
+                'to_member__user',
+            )
+        )
+        settlements.sort(key=lambda s: (s.status == 'completed', s.updated_at))
+        return Response(SettlementSerializer(settlements, many=True).data)
+
+    @action(detail=False, methods=['get'], url_path='detail/(?P<settlement_id>[^/.]+)')
+    def detail_view(self, request, settlement_id=None):
+        s = Settlement.objects.prefetch_related(
+            'payments',
+            'payments__paid_by__user',
+            'payments__paid_to__user',
+            'from_member__user',
+            'to_member__user',
+        ).filter(pk=settlement_id).first()
+        if not s:
+            return Response({'detail': 'Not found.'}, status=404)
+        group, err = self._get_group(s.group_id, request.user)
+        if err: return err
+        return Response(SettlementSerializer(s).data)
+
+    @action(detail=False, methods=['post'], url_path='(?P<settlement_id>[^/.]+)/pay')
+    def pay(self, request, settlement_id=None):
+        s = get_object_or_404(Settlement, pk=settlement_id)
+        group, err = self._get_group(s.group_id, request.user)
+        if err: return err
+        if s.status == 'completed':
+            return Response({'error': 'Already fully settled'}, status=400)
+
+        amount = request.data.get('amount')
+        note   = request.data.get('note', '').strip()
+        try:
+            amount_paise = int(Decimal(str(amount)) * 100)
+        except Exception:
+            return Response({'error': 'Invalid amount'}, status=400)
+
+        if amount_paise <= 0:
+            return Response({'error': 'Amount must be positive'}, status=400)
+        if amount_paise > s.remaining_paise:
+            return Response({
+                'error': f'Amount exceeds remaining balance of ₹{s.remaining_paise/100:.2f}'
+            }, status=400)
+
+        payment_type = 'full' if amount_paise == s.remaining_paise else 'partial'
+        payer_member = GroupMember.objects.filter(group=group, user=request.user).first()
+        SettlementPayment.objects.create(
+            settlement=s,
+            amount_paise=amount_paise,
+            note=note,
+            paid_by=payer_member,
+            paid_to=s.to_member,
+            payment_type=payment_type,
+        )
+
+        s.paid_paise += amount_paise
+        if s.paid_paise >= s.total_paise:
+            s.paid_paise = s.total_paise
+            s.status     = 'completed'
+            s.completed_at = timezone.now()
+        else:
+            s.status = 'partial'
+        s.save()
+
+        payer    = s.payer
+        receiver = s.receiver
+        fmt      = lambda p: f"₹{p/100:,.2f}"
+
+        if receiver.user:
+            Notification.objects.create(
+                user=receiver.user,
+                type='expense_added',
+                title=f'{payer.user.name if payer.user else payer.display_name} paid you {fmt(amount_paise)}',
+                message=(
+                    f'{payer.user.name if payer.user else payer.display_name} paid {fmt(amount_paise)} towards their debt of '
+                    f'{fmt(s.total_paise)} in group "{group.name}".'
+                    + (' Settlement completed! 🎉' if s.status == 'completed' else
+                       f' Remaining: {fmt(s.remaining_paise)}')
+                ),
+                group=group,
+            )
+
+        if s.status == 'completed' and payer.user:
+            Notification.objects.create(
+                user=payer.user,
+                type='expense_added',
+                title=f'You fully settled with {receiver.user.name if receiver.user else receiver.display_name} 🎉',
+                message=f'Your debt of {fmt(s.total_paise)} to {receiver.user.name if receiver.user else receiver.display_name} in "{group.name}" is fully cleared.',
+                group=group,
+            )
+
+        return Response(SettlementSerializer(s).data)
+
+    def _sync_settlements(self, group):
+        """Recalculate debts from expenses and update Settlement records."""
+        from .settle import compute_settlements
+        transactions = compute_settlements(group)
+
+        # Load all existing non-completed settlements
+        existing = {
+            (s.from_member_id, s.to_member_id): s
+            for s in Settlement.objects.filter(group=group)
+        }
+
+        seen = set()
+        for t in transactions:
+            key = (t['from_member_id'], t['to_member_id'])
+            seen.add(key)
+            if key in existing:
+                s = existing[key]
+                # Do not modify s.total_paise here — payments are authoritative for progress.
+                if s.remaining_paise == 0:
+                    s.status = 'completed'
+                elif s.paid_paise > 0:
+                    s.status = 'partial'
+                else:
+                    s.status = 'pending'
+                s.save()
+            else:
+                Settlement.objects.get_or_create(
+                    group=group,
+                    from_member_id=t['from_member_id'],
+                    to_member_id=t['to_member_id'],
+                    defaults={
+                        'total_paise': t['amount_paise'],
+                        'status': 'pending',
+                    }
+                )
+
+    def _sync_settlements(self, group):
+        """Recalculate debts from expenses and update Settlement records."""
+        from .settle import compute_settlements
+        transactions = compute_settlements(group)
+
+        # Load all existing non-completed settlements
+        existing = {
+            (s.from_member_id, s.to_member_id): s
+            for s in Settlement.objects.filter(group=group)
+        }
+
+        seen = set()
+        for t in transactions:
+            key = (t['from_member_id'], t['to_member_id'])
+            seen.add(key)
+            if key in existing:
+                s = existing[key]
+                if s.remaining_paise == 0:
+                    s.status = 'completed'
+                elif s.paid_paise > 0:
+                    s.status = 'partial'
+                else:
+                    s.status = 'pending'
+                s.save()
+            else:
+                Settlement.objects.get_or_create(
+                    group=group,
+                    from_member_id=t['from_member_id'],
+                    to_member_id=t['to_member_id'],
+                    defaults={
+                        'total_paise': t['amount_paise'],
+                        'status': 'pending',
+                    }
+                )
 
 # =========================
 # GROUP VIEWS
@@ -529,14 +712,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         )
     def create(self, request, *args, **kwargs):
         group_id = request.data.get('group')
+        data = request.data.copy()
+        if not data.get('paid_by_member') and data.get('paid_by_member_id'):
+            data['paid_by_member'] = data.get('paid_by_member_id')
         if group_id:
             if not GroupMember.objects.filter(group_id=group_id, user=request.user).exists():
                 return Response({'error': 'Not a member of this group'}, status=403)
-            paid_by_member_id = request.data.get('paid_by_member_id')
+            paid_by_member_id = data.get('paid_by_member') or data.get('paid_by_member_id')
             if paid_by_member_id and group_id:
                 if not GroupMember.objects.filter(id=paid_by_member_id, group_id=group_id).exists():
                     return Response({'error': 'Payer is not a member of this group'}, status=400)
-        s = self.get_serializer(data=request.data)
+        s = self.get_serializer(data=data)
         if not s.is_valid():
             return Response({'errors': s.errors}, status=400)
         self.perform_create(s)
@@ -555,9 +741,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        data = request.data.copy()
+        if not data.get('paid_by_member') and data.get('paid_by_member_id'):
+            data['paid_by_member'] = data.get('paid_by_member_id')
         serializer = self.get_serializer(
             expense,
-            data=request.data,
+            data=data,
             partial=kwargs.get("partial", False),
         )
 

@@ -1,8 +1,7 @@
 from rest_framework import serializers
 from decimal import Decimal
 import re
-from .models import User, Group, GroupMember, Expense, ExpenseShare, Notification
-
+from .models import User, Group, GroupMember, Expense, ExpenseShare, Notification, Settlement, SettlementPayment
 AVATAR_COLORS = [
     '#6366f1','#ec4899','#10b981','#f59e0b',
     '#3b82f6','#8b5cf6','#ef4444','#14b8a6',
@@ -347,3 +346,88 @@ class GroupSerializer(serializers.ModelSerializer):
             if uid != creator.id:
                 GroupMember.objects.get_or_create(group=group, user_id=uid)
         return group
+class SettlementPaymentSerializer(serializers.ModelSerializer):
+    amount_rupees = serializers.SerializerMethodField()
+    paid_by       = serializers.SerializerMethodField()
+    paid_to       = serializers.SerializerMethodField()
+    created_at    = serializers.DateTimeField(read_only=True)
+    payment_type  = serializers.CharField(source='get_payment_type_display', read_only=True)
+
+    class Meta:
+        model  = SettlementPayment
+        fields = [
+            'id', 'amount_paise', 'amount_rupees', 'note',
+            'payment_type', 'paid_by', 'paid_to', 'created_at',
+        ]
+
+    def get_amount_rupees(self, obj):
+        return str(Decimal(obj.amount_paise) / 100)
+
+    def get_paid_by(self, obj):
+        return member_display(obj.paid_by) if obj.paid_by else None
+
+    def get_paid_to(self, obj):
+        return member_display(obj.paid_to) if obj.paid_to else None
+
+
+class SettlementSerializer(serializers.ModelSerializer):
+    from_member        = serializers.SerializerMethodField()
+    to_member          = serializers.SerializerMethodField()
+    total_amount       = serializers.SerializerMethodField()
+    paid_amount        = serializers.SerializerMethodField()
+    remaining_paise    = serializers.SerializerMethodField()
+    remaining_amount   = serializers.SerializerMethodField()
+    remaining_rupees   = serializers.SerializerMethodField()
+    payments           = SettlementPaymentSerializer(many=True, read_only=True)
+    expense_breakdown  = serializers.SerializerMethodField()
+    completed_at       = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model  = Settlement
+        fields = [
+            'id', 'from_member', 'to_member',
+            'total_paise', 'total_amount', 'paid_paise', 'paid_amount',
+            'remaining_paise', 'remaining_amount', 'remaining_rupees',
+            'status', 'completed_at', 'payments', 'expense_breakdown',
+            'created_at', 'updated_at',
+        ]
+
+    def get_from_member(self, obj):
+        return member_display(obj.from_member)
+
+    def get_to_member(self, obj):
+        return member_display(obj.to_member)
+
+    def get_remaining_paise(self, obj):
+        return obj.remaining_paise
+
+    def get_total_amount(self, obj):
+        return str(Decimal(obj.total_paise) / 100)
+
+    def get_paid_amount(self, obj):
+        return str(Decimal(obj.paid_paise) / 100)
+
+    def get_remaining_amount(self, obj):
+        return str(Decimal(obj.remaining_paise) / 100)
+
+    def get_remaining_rupees(self, obj):
+        return str(Decimal(obj.remaining_paise) / 100)
+
+    def get_expense_breakdown(self, obj):
+        shares = ExpenseShare.objects.filter(
+            member=obj.from_member,
+            expense__group=obj.group,
+            expense__paid_by_member=obj.to_member,
+        ).select_related('expense')
+
+        breakdown = []
+        for share in shares:
+            expense = share.expense
+            breakdown.append({
+                'expense_title': expense.description,
+                'expense_date': expense.date,
+                'amount_paise': share.amount_paise,
+                'amount_rupees': str(Decimal(share.amount_paise) / 100),
+                'split_details': f"Owes {str(Decimal(share.amount_paise) / 100)} for this expense",
+            })
+        return breakdown
