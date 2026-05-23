@@ -3,13 +3,13 @@ import os
 from dotenv import load_dotenv
 from datetime import timedelta
 
-load_dotenv(encoding='utf-8-sig')
+load_dotenv(encoding='utf-8-sig')  # single load at the top
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-dev-key-change-in-production')
-DEBUG = True
-ALLOWED_HOSTS = ['*']
+DEBUG      = os.getenv('DEBUG', 'True') == 'True'
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -75,24 +75,26 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
+    'ACCESS_TOKEN_LIFETIME':  timedelta(days=7),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
-    'ROTATE_REFRESH_TOKENS': True,
-    'AUTH_HEADER_TYPES': ('Bearer',),
-    'USER_ID_FIELD': 'id',
-    'USER_ID_CLAIM': 'user_id',
+    'ROTATE_REFRESH_TOKENS':  True,
+    'AUTH_HEADER_TYPES':      ('Bearer',),
+    'USER_ID_FIELD':          'id',
+    'USER_ID_CLAIM':          'user_id',
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'Asia/Kolkata'
-USE_I18N = True
-USE_TZ = True
+TIME_ZONE     = 'Asia/Kolkata'
+USE_I18N      = True
+USE_TZ        = True
 
-STATIC_URL = 'static/'
+STATIC_URL         = 'static/'
+STATIC_ROOT        = BASE_DIR / 'staticfiles'   # needed for Render
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# App-specific env vars — all read after load_dotenv() above
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
-DEFAULT_CURRENCY = 'INR'
+DEFAULT_CURRENCY   = 'INR'
